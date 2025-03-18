@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
 
+import os
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -86,6 +87,15 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
+def repeat_weight_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    first_dim, second_dim, third_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:,None,:,:]
+        .expand(first_dim, n_rep, second_dim, third_dim)
+        .reshape(first_dim * n_rep, second_dim, third_dim)
+    )
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -143,21 +153,132 @@ class Attention(nn.Module):
             )
         ).cuda()
 
+        # cache x value for each layer
+        self.cache_x = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                args.dim,
+            )
+        ).cuda()
+
     def forward(
         self,
+        layer_id,
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
         bsz, seqlen, _ = x.shape
+        self.cache_x[:bsz, start_pos : start_pos + seqlen] = x
+        
+        '''if seqlen == 1:
+            x_uint16 = x.cpu().view(torch.uint16)
+
+            # 打印每个 bfloat16 数值的二进制表示
+            for i, value in enumerate(x_uint16.numpy().flatten()):
+                if i == 0:
+                    bin_repr = f"{int(value):016b}"  # 转换为 16-bit 二进制字符串
+                    print(f"Index {i}: {bin_repr} (Hex: {int(value):04X})")
+            exit()
+        if seqlen == 1:
+            try:
+                os.makedirs("debug_output", exist_ok=True)
+                with open('debug_output/x_value.bin', 'wb') as f:
+                    x_flat = x.reshape(-1)
+                    x.cpu().to(torch.float32).numpy().tofile(f)
+                exit()
+            except Exception as e:
+                print(f"保存x数据时出错: {e}")
+                exit()'''
+        
+        # 获取两个权重矩阵的值
+        '''try:
+            os.makedirs("debug_output", exist_ok=True)
+            with open('debug_output/wq_weight.bin', 'wb') as f:
+                self.wq.weight.data.cpu().to(torch.float32).numpy().tofile(f)
+            with open('debug_output/wk_weight.bin', 'wb') as f:
+                wk_weight = self.wk.weight.data.view(8,128,4096)
+                wk_weight = repeat_weight_kv(wk_weight, 4)
+                wk_weight = wk_weight.view(4096,4096)
+                wk_weight.cpu().to(torch.float32).numpy().tofile(f)
+            with open('debug_output/wv_weight.bin', 'wb') as f:
+                wv_weight = self.wv.weight.data.view(8,128,4096)
+                wv_weight = repeat_weight_kv(wv_weight, 4)
+                wv_weight = wv_weight.view(4096,4096)
+                wv_weight.cpu().to(torch.float32).numpy().tofile(f)
+            exit()
+        except Exception as e:
+            print(f"保存权重数据时出错: {e}")
+            exit()'''
+        
+        # new pattern
+        if seqlen == 1:
+            print(f"x value: {x[:,:,-1]}")
+            xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+            xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+
+            #########################################################
+            xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+            xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+            self.cache_k = self.cache_k.to(xq)
+            self.cache_v = self.cache_v.to(xq)
+
+            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+
+            keys = self.cache_k[:bsz, : start_pos + seqlen]
+            values = self.cache_v[:bsz, : start_pos + seqlen]
+            values = repeat_kv(values, self.n_rep)  
+            #########################################################
+
+            # 复制wk权重
+            wk_data = self.wk.weight.data.view(self.n_kv_heads,self.head_dim, self.n_local_heads * self.head_dim)
+            wk_data = repeat_weight_kv(wk_data, self.n_rep)
+            wk_data = wk_data.view(4096,4096)
+            wk_data = wk_data.transpose(0,1)
+            wk_data = wk_data.view(4096, 32, 128)
+            wk_data = wk_data.transpose(0,1)
+            temp1 = torch.matmul(xq.transpose(1,2), wk_data.transpose(1,2))
+            # temp1 shape: (1, 32, 1, 4096)
+
+            x_pre = self.cache_x[:bsz, : start_pos + seqlen]
+            x_pre = x_pre.view(bsz, 20, 4096)
+            new_scores = torch.matmul(temp1, x_pre.transpose(1,2)) / math.sqrt(self.head_dim)
+            new_scores = F.softmax(new_scores.float(), dim=-1).type_as(xq)
+            
+            
+            new_output = torch.matmul(new_scores, values.transpose(1,2))  # (bs, n_local_heads, seqlen, head_dim)
+            new_output = new_output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+            
+            import numpy as np
+            np.set_printoptions(threshold=np.inf)
+            new_output_np = new_output.cpu().to(torch.float32).detach().numpy()
+            with open('debug_output/new_sv_result.txt', 'w') as f:
+                f.write(f"Scores shape: {new_output.shape}\n")
+                f.write(str(new_output_np))
+            exit()
+            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+            os.makedirs("debug_output", exist_ok=True)
+            import numpy as np
+            scores_np = new_scores.cpu().to(torch.float32).detach().numpy()
+                # 如果需要以文本形式保存
+            with open('debug_output/new_qk_result.txt', 'w') as text_file:
+                text_file.write(f"Scores shape: {new_scores.shape}\n")
+                text_file.write(str(scores_np))
+            exit()
+
+        
+        # 继续正常的前向传播
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        #xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
@@ -182,11 +303,30 @@ class Attention(nn.Module):
             1, 2
         )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # socres shape: (bs, n_local_heads, seqlen, cache_len + seqlen)
+
+        #测试两种方式结果是否一样
+        # original pattern 
+        '''if seqlen == 1:
+            print(f"x value: {x[:,:,-1]}")
+            os.makedirs("debug_output", exist_ok=True)
+            import numpy as np
+            scores_np = scores.cpu().to(torch.float32).detach().numpy()
+                # 如果需要以文本形式保存
+            with open('debug_output/original_qk_result.txt', 'w') as text_file:
+                text_file.write(f"Scores shape: {scores.shape}\n")
+                text_file.write(str(scores_np))
+            exit()'''
+        
+        
+            
+
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        
         return self.wo(output)
 
 
@@ -238,12 +378,13 @@ class TransformerBlock(nn.Module):
 
     def forward(
         self,
+        layer_id,
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        h = x + self.attention(layer_id, self.attention_norm(x), start_pos, freqs_cis, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -294,9 +435,12 @@ class Transformer(nn.Module):
             mask = torch.hstack(
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
             ).type_as(h)
+        
+        layer_id = 0
 
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(layer_id, h, start_pos, freqs_cis, mask)
+            layer_id += 1
         h = self.norm(h)
         output = self.output(h).float()
         return output
